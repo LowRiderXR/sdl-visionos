@@ -2379,6 +2379,23 @@ extern SDL_DECLSPEC SDL_GPUDevice * SDLCALL SDL_CreateGPUDevice(
  * does not write to sRGB textures. (For history's sake: MacFamily1 also does
  * not support indirect command buffers, MSAA depth resolve, and stencil
  * resolve/feedback, but these are not exposed features in SDL_GPU.)
+ * - `SDL_PROP_GPU_DEVICE_CREATE_METAL_DEVICE_POINTER`: an existing
+ *   `id<MTLDevice>` the GPU device should use instead of creating its own.
+ *   This lets SDL_GPU share a device with other Metal code in the process
+ *   (for example a compositor or a platform layer that owns the device). If
+ *   `SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_QUEUE_POINTER` is not also set,
+ *   SDL creates its own command queue on this device. SDL retains the object
+ *   for the lifetime of the GPU device and releases only its own reference in
+ *   SDL_DestroyGPUDevice; the application keeps ownership. Defaults to NULL.
+ * - `SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_QUEUE_POINTER`: an existing
+ *   `id<MTLCommandQueue>` the GPU device should submit its command buffers
+ *   to. Command buffers from SDL and from the application then execute in
+ *   commit order on the same queue, which makes ordering between them a
+ *   matter of commit order instead of CPU waits. The device of the queue is
+ *   used as the GPU device's device; if
+ *   `SDL_PROP_GPU_DEVICE_CREATE_METAL_DEVICE_POINTER` is also set and does
+ *   not match the queue's device, device creation fails. Ownership is as for
+ *   the device pointer. Defaults to NULL.
  *
  * \param props the properties to use.
  * \returns a GPU context on success or NULL on failure; call SDL_GetError()
@@ -2415,6 +2432,8 @@ extern SDL_DECLSPEC SDL_GPUDevice * SDLCALL SDL_CreateGPUDeviceWithProperties(
 #define SDL_PROP_GPU_DEVICE_CREATE_VULKAN_REQUIRE_HARDWARE_ACCELERATION_BOOLEAN "SDL.gpu.device.create.vulkan.requirehardwareacceleration"
 #define SDL_PROP_GPU_DEVICE_CREATE_VULKAN_OPTIONS_POINTER                       "SDL.gpu.device.create.vulkan.options"
 #define SDL_PROP_GPU_DEVICE_CREATE_METAL_ALLOW_MACFAMILY1_BOOLEAN               "SDL.gpu.device.create.metal.allowmacfamily1"
+#define SDL_PROP_GPU_DEVICE_CREATE_METAL_DEVICE_POINTER                         "SDL.gpu.device.create.metal.device"
+#define SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_QUEUE_POINTER                  "SDL.gpu.device.create.metal.command_queue"
 
 #define SDL_PROP_GPU_DEVICE_CREATE_XR_ENABLE_BOOLEAN                            "SDL.gpu.device.create.xr.enable"
 #define SDL_PROP_GPU_DEVICE_CREATE_XR_INSTANCE_POINTER                          "SDL.gpu.device.create.xr.instance_out"
@@ -2616,6 +2635,21 @@ extern SDL_DECLSPEC SDL_GPUShaderFormat SDLCALL SDL_GetGPUShaderFormats(SDL_GPUD
  * Driver Branch: promo490_3_Google
  * ```
  *
+ * With the Metal backend:
+ *
+ * - `SDL_PROP_GPU_DEVICE_METAL_DEVICE_POINTER`: the `id<MTLDevice>` the GPU
+ *   device renders with. This is the device passed in
+ *   `SDL_PROP_GPU_DEVICE_CREATE_METAL_DEVICE_POINTER` if one was given,
+ *   otherwise the device SDL created. The object is owned by the GPU device
+ *   (or by the application, if it was passed in) and stays valid until
+ *   SDL_DestroyGPUDevice.
+ * - `SDL_PROP_GPU_DEVICE_METAL_COMMAND_QUEUE_POINTER`: the
+ *   `id<MTLCommandQueue>` the GPU device submits its command buffers to,
+ *   either the one passed in
+ *   `SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_QUEUE_POINTER` or the one SDL
+ *   created. Applications can use it to commit their own Metal command
+ *   buffers in order with SDL's.
+ *
  * \param device a GPU context to query.
  * \returns a valid property ID on success or 0 on failure; call
  *          SDL_GetError() for more information.
@@ -2630,6 +2664,8 @@ extern SDL_DECLSPEC SDL_PropertiesID SDLCALL SDL_GetGPUDeviceProperties(SDL_GPUD
 #define SDL_PROP_GPU_DEVICE_DRIVER_NAME_STRING        "SDL.gpu.device.driver_name"
 #define SDL_PROP_GPU_DEVICE_DRIVER_VERSION_STRING     "SDL.gpu.device.driver_version"
 #define SDL_PROP_GPU_DEVICE_DRIVER_INFO_STRING        "SDL.gpu.device.driver_info"
+#define SDL_PROP_GPU_DEVICE_METAL_DEVICE_POINTER      "SDL.gpu.device.metal.device"
+#define SDL_PROP_GPU_DEVICE_METAL_COMMAND_QUEUE_POINTER "SDL.gpu.device.metal.command_queue"
 
 
 /* State Creation */

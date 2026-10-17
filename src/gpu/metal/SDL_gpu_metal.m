@@ -4575,6 +4575,7 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
     @autoreleasepool {
         MetalRenderer *renderer;
         id<MTLDevice> device = NULL;
+        id<MTLCommandQueue> queue = NULL;
         bool hasHardwareSupport = false;
 
         bool verboseLogs = SDL_GetBooleanProperty(
@@ -4591,9 +4592,33 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
             SDL_setenv_unsafe("MTL_DEBUG_LAYER", "1", 0);
         }
 
+        // Use a device and/or command queue provided by the application, if any.
+        // The objects stay owned by the application: __bridge casts do not
+        // transfer ownership, the renderer only holds its own strong reference.
+        {
+            id<MTLDevice> externalDevice = (__bridge id<MTLDevice>)SDL_GetPointerProperty(
+                props,
+                SDL_PROP_GPU_DEVICE_CREATE_METAL_DEVICE_POINTER,
+                NULL);
+            id<MTLCommandQueue> externalQueue = (__bridge id<MTLCommandQueue>)SDL_GetPointerProperty(
+                props,
+                SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_QUEUE_POINTER,
+                NULL);
+            if (externalQueue != NULL) {
+                if (externalDevice != NULL && externalQueue.device != externalDevice) {
+                    SDL_SetError("The provided MTLCommandQueue does not belong to the provided MTLDevice");
+                    return NULL;
+                }
+                device = externalQueue.device;
+                queue = externalQueue;
+            } else if (externalDevice != NULL) {
+                device = externalDevice;
+            }
+        }
+
         // Create the Metal device and command queue
 #ifdef SDL_PLATFORM_MACOS
-        if (preferLowPower) {
+        if (device == NULL && preferLowPower) {
             NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
             for (id<MTLDevice> candidate in devices) {
                 if (candidate.isLowPower) {
@@ -4643,7 +4668,13 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
         renderer = (MetalRenderer *)SDL_calloc(1, sizeof(MetalRenderer));
 
         renderer->device = device;
-        renderer->queue = [device newCommandQueue];
+        renderer->queue = (queue != NULL) ? queue : [device newCommandQueue];
+        if (renderer->queue == NULL) {
+            renderer->device = nil;
+            SDL_free(renderer);
+            SDL_SetError("Failed to create Metal command queue");
+            return NULL;
+        }
 
         renderer->props = SDL_CreateProperties();
         if (verboseLogs) {
@@ -4656,6 +4687,16 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
             renderer->props,
             SDL_PROP_GPU_DEVICE_NAME_STRING,
             deviceName);
+
+        // Expose the device and command queue so the application can share them
+        SDL_SetPointerProperty(
+            renderer->props,
+            SDL_PROP_GPU_DEVICE_METAL_DEVICE_POINTER,
+            (__bridge void *)renderer->device);
+        SDL_SetPointerProperty(
+            renderer->props,
+            SDL_PROP_GPU_DEVICE_METAL_COMMAND_QUEUE_POINTER,
+            (__bridge void *)renderer->queue);
         if (verboseLogs) {
             SDL_LogInfo(SDL_LOG_CATEGORY_GPU, "Metal Device: %s", deviceName);
         }
