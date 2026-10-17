@@ -3176,6 +3176,18 @@ extern SDL_DECLSPEC SDL_GPUShader * SDLCALL SDL_CreateGPUShader(
  *   clear the texture to a stencil of this Uint8 value. Defaults to zero.
  * - `SDL_PROP_GPU_TEXTURE_CREATE_NAME_STRING`: a name that can be displayed
  *   in debugging tools.
+ * - `SDL_PROP_GPU_TEXTURE_CREATE_METAL_TEXTURE_POINTER`: (Metal only) an
+ *   existing `id<MTLTexture>` to wrap instead of allocating a new texture,
+ *   for example a drawable texture handed out by a compositor. The create
+ *   info must describe the texture exactly (type, format, width, height,
+ *   layer count or depth, mip levels, sample count), and the Metal usage of
+ *   the texture must cover the requested SDL usage; otherwise creation fails
+ *   with an error that names the mismatch. A wrapped texture is never cycled,
+ *   so render passes and uploads with `cycle` set still write to the provided
+ *   texture. SDL retains the object while the SDL_GPUTexture exists and
+ *   releases only that reference after SDL_ReleaseGPUTexture, once no
+ *   submitted command buffer uses it anymore; the application keeps
+ *   ownership. Defaults to NULL.
  *
  * \param device a GPU Context.
  * \param createinfo a struct describing the state of the texture to create.
@@ -3208,6 +3220,7 @@ extern SDL_DECLSPEC SDL_GPUTexture * SDLCALL SDL_CreateGPUTexture(
 #define SDL_PROP_GPU_TEXTURE_CREATE_D3D12_CLEAR_DEPTH_FLOAT     "SDL.gpu.texture.create.d3d12.clear.depth"
 #define SDL_PROP_GPU_TEXTURE_CREATE_D3D12_CLEAR_STENCIL_NUMBER  "SDL.gpu.texture.create.d3d12.clear.stencil"
 #define SDL_PROP_GPU_TEXTURE_CREATE_NAME_STRING                 "SDL.gpu.texture.create.name"
+#define SDL_PROP_GPU_TEXTURE_CREATE_METAL_TEXTURE_POINTER       "SDL.gpu.texture.create.metal.texture"
 
 /**
  * Creates a buffer object to be used in graphics or compute workflows.

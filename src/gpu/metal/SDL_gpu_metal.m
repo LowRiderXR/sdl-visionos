@@ -1509,6 +1509,89 @@ static bool METAL_SupportsSampleCount(
     }
 }
 
+// Wraps an MTLTexture owned by the application (see
+// SDL_PROP_GPU_TEXTURE_CREATE_METAL_TEXTURE_POINTER). The create info must
+// match the texture; the MetalTexture holds its own strong reference to the
+// handle and releases only that reference when it is destroyed.
+static MetalTexture *METAL_INTERNAL_WrapExternalTexture(
+    MetalRenderer *renderer,
+    const SDL_GPUTextureCreateInfo *createinfo,
+    id<MTLTexture> mtlTexture)
+{
+    MetalTexture *metalTexture;
+    const bool isMSAA = createinfo->sample_count > SDL_GPU_SAMPLECOUNT_1;
+    const MTLPixelFormat expectedFormat = SDLToMetal_TextureFormat(createinfo->format);
+    const MTLTextureType expectedType = SDLToMetal_TextureType(createinfo->type, isMSAA);
+    const NSUInteger expectedDepth = (createinfo->type == SDL_GPU_TEXTURETYPE_3D) ? createinfo->layer_count_or_depth : 1;
+    const NSUInteger expectedLayers =
+        (createinfo->type == SDL_GPU_TEXTURETYPE_2D_ARRAY || createinfo->type == SDL_GPU_TEXTURETYPE_CUBE_ARRAY)
+            ? createinfo->layer_count_or_depth
+            : 1;
+    const NSUInteger expectedSamples = SDLToMetal_SampleCount[createinfo->sample_count];
+    MTLTextureUsage requiredUsage = 0;
+
+    if (mtlTexture.pixelFormat != expectedFormat) {
+        SDL_SetError("The provided MTLTexture has pixel format %lu, but the requested SDL_GPUTextureFormat maps to %lu",
+                     (unsigned long)mtlTexture.pixelFormat, (unsigned long)expectedFormat);
+        return NULL;
+    }
+    if (mtlTexture.textureType != expectedType) {
+        SDL_SetError("The provided MTLTexture has texture type %lu, but the requested SDL_GPUTextureType maps to %lu",
+                     (unsigned long)mtlTexture.textureType, (unsigned long)expectedType);
+        return NULL;
+    }
+    if (mtlTexture.width != createinfo->width || mtlTexture.height != createinfo->height) {
+        SDL_SetError("The provided MTLTexture is %lux%lu, but %ux%u was requested",
+                     (unsigned long)mtlTexture.width, (unsigned long)mtlTexture.height,
+                     createinfo->width, createinfo->height);
+        return NULL;
+    }
+    if (mtlTexture.depth != expectedDepth) {
+        SDL_SetError("The provided MTLTexture has depth %lu, but %lu was requested",
+                     (unsigned long)mtlTexture.depth, (unsigned long)expectedDepth);
+        return NULL;
+    }
+    if (mtlTexture.arrayLength != expectedLayers) {
+        SDL_SetError("The provided MTLTexture has %lu array layers, but %lu were requested",
+                     (unsigned long)mtlTexture.arrayLength, (unsigned long)expectedLayers);
+        return NULL;
+    }
+    if (mtlTexture.mipmapLevelCount != createinfo->num_levels) {
+        SDL_SetError("The provided MTLTexture has %lu mip levels, but %u were requested",
+                     (unsigned long)mtlTexture.mipmapLevelCount, createinfo->num_levels);
+        return NULL;
+    }
+    if (mtlTexture.sampleCount != expectedSamples) {
+        SDL_SetError("The provided MTLTexture has sample count %lu, but %lu was requested",
+                     (unsigned long)mtlTexture.sampleCount, (unsigned long)expectedSamples);
+        return NULL;
+    }
+
+    if (createinfo->usage & (SDL_GPU_TEXTUREUSAGE_COLOR_TARGET |
+                             SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET)) {
+        requiredUsage |= MTLTextureUsageRenderTarget;
+    }
+    if (createinfo->usage & (SDL_GPU_TEXTUREUSAGE_SAMPLER |
+                             SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ |
+                             SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_READ)) {
+        requiredUsage |= MTLTextureUsageShaderRead;
+    }
+    if (createinfo->usage & (SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_WRITE |
+                             SDL_GPU_TEXTUREUSAGE_COMPUTE_STORAGE_SIMULTANEOUS_READ_WRITE)) {
+        requiredUsage |= MTLTextureUsageShaderWrite;
+    }
+    if ((mtlTexture.usage & requiredUsage) != requiredUsage) {
+        SDL_SetError("The provided MTLTexture has usage 0x%lx, which does not cover the Metal usage 0x%lx required by the requested SDL usage",
+                     (unsigned long)mtlTexture.usage, (unsigned long)requiredUsage);
+        return NULL;
+    }
+
+    metalTexture = (MetalTexture *)SDL_calloc(1, sizeof(MetalTexture));
+    metalTexture->handle = mtlTexture; // ARC: the renderer's own strong reference
+    SDL_SetAtomicInt(&metalTexture->referenceCount, 0);
+    return metalTexture;
+}
+
 static SDL_GPUTexture *METAL_CreateTexture(
     SDL_GPURenderer *driverData,
     const SDL_GPUTextureCreateInfo *createinfo)
@@ -1517,17 +1600,32 @@ static SDL_GPUTexture *METAL_CreateTexture(
         MetalRenderer *renderer = (MetalRenderer *)driverData;
         MetalTextureContainer *container;
         MetalTexture *texture;
+        id<MTLTexture> externalTexture = (__bridge id<MTLTexture>)SDL_GetPointerProperty(
+            createinfo->props,
+            SDL_PROP_GPU_TEXTURE_CREATE_METAL_TEXTURE_POINTER,
+            NULL);
 
-        texture = METAL_INTERNAL_CreateTexture(
-            renderer,
-            createinfo);
-
-        if (texture == NULL) {
-            SET_STRING_ERROR_AND_RETURN("Failed to create texture", NULL);
+        if (externalTexture != NULL) {
+            texture = METAL_INTERNAL_WrapExternalTexture(
+                renderer,
+                createinfo,
+                externalTexture);
+            if (texture == NULL) {
+                return NULL; // error already set with the mismatch
+            }
+        } else {
+            texture = METAL_INTERNAL_CreateTexture(
+                renderer,
+                createinfo);
+            if (texture == NULL) {
+                SET_STRING_ERROR_AND_RETURN("Failed to create texture", NULL);
+            }
         }
 
         container = SDL_calloc(1, sizeof(MetalTextureContainer));
-        container->canBeCycled = 1;
+        // External textures are never cycled: the application expects its
+        // texture to receive the writes, and SDL could not allocate a twin.
+        container->canBeCycled = (externalTexture != NULL) ? 0 : 1;
 
         // Copy properties so we don't lose information when the client destroys them
         container->header.info = *createinfo;
