@@ -759,8 +759,11 @@ static void METAL_DestroyDevice(SDL_GPUDevice *device)
     SDL_DestroyMutex(renderer->fenceLock);
     SDL_DestroyMutex(renderer->windowLock);
 
-    // Release the command queue
+    // Release the command queue and device. These are the renderer's own
+    // references only; objects provided by the application through the
+    // create properties keep the references the application holds.
     renderer->queue = nil;
+    renderer->device = nil;
 
     // Release properties
     SDL_DestroyProperties(renderer->props);
