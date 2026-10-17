@@ -1120,12 +1120,16 @@ struct SDL_GPUDevice
         SDL_GPURenderer *driverData,
         Uint32 viewCount);
 
-    void (*BeginRenderPassWithViewCount)(
+    // Render pass with multiview and backend-specific properties (Metal:
+    // rasterization rate map). Returns false with an error set when a
+    // property cannot be honored; the pass is then not begun.
+    bool (*BeginRenderPassWithProperties)(
         SDL_GPUCommandBuffer *commandBuffer,
         const SDL_GPUColorTargetInfo *colorTargetInfos,
         Uint32 numColorTargets,
         const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo,
-        Uint32 viewCount);
+        Uint32 viewCount,
+        SDL_PropertiesID props);
 
     // Opaque pointer for the Driver
     SDL_GPURenderer *driverData;

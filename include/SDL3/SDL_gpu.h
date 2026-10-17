@@ -3715,6 +3715,32 @@ extern SDL_DECLSPEC SDL_GPURenderPass * SDLCALL SDL_BeginGPURenderPass(
  *   one view fails on backends and devices without support; check
  *   SDL_GPUSupportsViewCount first.
  *
+ * With the Metal backend:
+ *
+ * - `SDL_PROP_GPU_RENDERPASS_CREATE_METAL_RASTERIZATION_RATE_MAP_POINTER`: an
+ *   `id<MTLRasterizationRateMap>` to rasterize this pass with (variable
+ *   rasterization rate, for example the foveation map a compositor provides
+ *   for its drawables). The color and depth stencil targets must be at least
+ *   as large as the physical size of every map layer used by the pass (a
+ *   compositor may hand out textures sized for its maximum quality and use
+ *   only the part the map describes), the map needs at least as many layers
+ *   as the pass has views, and the pass must start at layer 0
+ *   (`layer_or_depth_plane` and `layer` of all targets must be 0): view `i`
+ *   is rasterized with map layer `i`, and only that mapping is defined.
+ *   With a map, the viewport and the scissor
+ *   rectangle are in the map's logical screen space (`screenSize`), not in
+ *   texture pixels: the default viewport and scissor cover `screenSize`, and
+ *   SDL_SetGPUViewport and SDL_SetGPUScissor take logical coordinates.
+ *   Interpolated vertex outputs follow the logical space as well, while the
+ *   fragment position (`SV_Position`, `[[position]]`) stays in physical
+ *   texture pixels; use the map's decoder (Metal
+ *   `rasterization_rate_map_decoder`) to convert between the two in a
+ *   shader. Intermediate render targets of your own need their own map or
+ *   none at all; the map describes the targets it was created for. SDL
+ *   retains the map only for the duration of the pass; the application keeps
+ *   ownership. Fails on backends and devices without support. Defaults to
+ *   NULL.
+ *
  * \param command_buffer a command buffer.
  * \param color_target_infos an array of texture subresources with
  *                           corresponding clear values and load/store ops.
@@ -3741,6 +3767,7 @@ extern SDL_DECLSPEC SDL_GPURenderPass * SDLCALL SDL_BeginGPURenderPassWithProper
     SDL_PropertiesID props);
 
 #define SDL_PROP_GPU_RENDERPASS_CREATE_VIEW_COUNT_NUMBER "SDL.gpu.renderpass.create.view_count"
+#define SDL_PROP_GPU_RENDERPASS_CREATE_METAL_RASTERIZATION_RATE_MAP_POINTER "SDL.gpu.renderpass.create.metal.rasterization_rate_map"
 
 /**
  * Binds a graphics pipeline on a render pass to be used in rendering.

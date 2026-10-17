@@ -1876,8 +1876,13 @@ SDL_GPURenderPass *SDL_BeginGPURenderPassWithProperties(
             return NULL;
         }
         view_count = (Uint32)requested;
+        if (SDL_HasProperty(props, SDL_PROP_GPU_RENDERPASS_CREATE_METAL_RASTERIZATION_RATE_MAP_POINTER) &&
+            COMMAND_BUFFER_DEVICE->BeginRenderPassWithProperties == NULL) {
+            SDL_SetError("A rasterization rate map is not supported by the %s backend", COMMAND_BUFFER_DEVICE->backend);
+            return NULL;
+        }
         if (view_count > 1) {
-            if (COMMAND_BUFFER_DEVICE->BeginRenderPassWithViewCount == NULL ||
+            if (COMMAND_BUFFER_DEVICE->BeginRenderPassWithProperties == NULL ||
                 !SDL_GPUSupportsViewCount(COMMAND_BUFFER_DEVICE, view_count)) {
                 SDL_SetError("A view count of %u is not supported by the %s backend on this device", view_count, COMMAND_BUFFER_DEVICE->backend);
                 return NULL;
@@ -2002,13 +2007,16 @@ SDL_GPURenderPass *SDL_BeginGPURenderPassWithProperties(
         }
     }
 
-    if (view_count > 1) {
-        COMMAND_BUFFER_DEVICE->BeginRenderPassWithViewCount(
-            command_buffer,
-            color_target_infos,
-            num_color_targets,
-            depth_stencil_target_info,
-            view_count);
+    if (view_count > 1 || (props != 0 && COMMAND_BUFFER_DEVICE->BeginRenderPassWithProperties != NULL)) {
+        if (!COMMAND_BUFFER_DEVICE->BeginRenderPassWithProperties(
+                command_buffer,
+                color_target_infos,
+                num_color_targets,
+                depth_stencil_target_info,
+                view_count,
+                props)) {
+            return NULL;
+        }
     } else {
         COMMAND_BUFFER_DEVICE->BeginRenderPass(
             command_buffer,

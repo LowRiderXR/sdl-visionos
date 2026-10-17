@@ -2421,15 +2421,85 @@ static void METAL_SetStencilReference(
     }
 }
 
-// viewCount > 1: multiview. The pass covers layers (slice .. slice + viewCount - 1)
-// of every target through renderTargetArrayLength, and the encoder maps
-// amplified vertex i to render target layer offset i (one shared viewport).
-static void METAL_INTERNAL_BeginRenderPass(
-    SDL_GPUCommandBuffer *commandBuffer,
+// Validates a rasterization rate map against the pass targets: device support,
+// enough layers for the views, targets starting at layer 0 (view i uses map
+// layer i, only that mapping is verified), and every target at least as large
+// as the physical size of each used map layer (a compositor may hand out
+// textures sized for its maximum quality and use the part the map describes).
+// Returns false with an SDL error set.
+static bool METAL_INTERNAL_ValidateRateMap(
+    MetalRenderer *renderer,
+    id<MTLRasterizationRateMap> rateMap,
     const SDL_GPUColorTargetInfo *colorTargetInfos,
     Uint32 numColorTargets,
     const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo,
     Uint32 viewCount)
+{
+    if (@available(macOS 10.15.4, iOS 13.0, tvOS 16.0, *)) {
+        if (rateMap.layerCount < viewCount) {
+            SDL_SetError("The rasterization rate map has %lu layers, but the render pass has %u views",
+                         (unsigned long)rateMap.layerCount, viewCount);
+            return false;
+        }
+        if (![renderer->device supportsRasterizationRateMapWithLayerCount:rateMap.layerCount]) {
+            SDL_SetError("This device does not support rasterization rate maps with %lu layers",
+                         (unsigned long)rateMap.layerCount);
+            return false;
+        }
+        for (Uint32 i = 0; i < numColorTargets; i += 1) {
+            const TextureCommonHeader *header = (const TextureCommonHeader *)colorTargetInfos[i].texture;
+            if (header->info.type != SDL_GPU_TEXTURETYPE_3D && colorTargetInfos[i].layer_or_depth_plane != 0) {
+                SDL_SetError("With a rasterization rate map the render pass must start at layer 0 (view i uses map layer i), but color target %u starts at layer %u",
+                             i, colorTargetInfos[i].layer_or_depth_plane);
+                return false;
+            }
+        }
+        if (depthStencilTargetInfo != NULL && depthStencilTargetInfo->layer != 0) {
+            SDL_SetError("With a rasterization rate map the render pass must start at layer 0 (view i uses map layer i), but the depth stencil target starts at layer %u",
+                         depthStencilTargetInfo->layer);
+            return false;
+        }
+        for (Uint32 layer = 0; layer < viewCount; layer += 1) {
+            MTLSize physical = [rateMap physicalSizeForLayer:layer];
+            for (Uint32 i = 0; i < numColorTargets; i += 1) {
+                const TextureCommonHeader *header = (const TextureCommonHeader *)colorTargetInfos[i].texture;
+                Uint32 w = header->info.width >> colorTargetInfos[i].mip_level;
+                Uint32 h = header->info.height >> colorTargetInfos[i].mip_level;
+                if (physical.width > w || physical.height > h) {
+                    SDL_SetError("Rasterization rate map layer %u has physical size %lux%lu, but color target %u is only %ux%u",
+                                 layer, (unsigned long)physical.width, (unsigned long)physical.height, i, w, h);
+                    return false;
+                }
+            }
+            if (depthStencilTargetInfo != NULL) {
+                const TextureCommonHeader *header = (const TextureCommonHeader *)depthStencilTargetInfo->texture;
+                Uint32 w = header->info.width >> depthStencilTargetInfo->mip_level;
+                Uint32 h = header->info.height >> depthStencilTargetInfo->mip_level;
+                if (physical.width > w || physical.height > h) {
+                    SDL_SetError("Rasterization rate map layer %u has physical size %lux%lu, but the depth stencil target is only %ux%u",
+                                 layer, (unsigned long)physical.width, (unsigned long)physical.height, w, h);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    SDL_SetError("Rasterization rate maps are not available on this OS version");
+    return false;
+}
+
+// viewCount > 1: multiview. The pass covers layers (slice .. slice + viewCount - 1)
+// of every target through renderTargetArrayLength, and the encoder maps
+// amplified vertex i to render target layer offset i (one shared viewport).
+// rateMap != nil: variable rasterization rate; viewport and scissor are then in
+// the map's logical screen space (screenSize), view i uses map layer i.
+static bool METAL_INTERNAL_BeginRenderPass(
+    SDL_GPUCommandBuffer *commandBuffer,
+    const SDL_GPUColorTargetInfo *colorTargetInfos,
+    Uint32 numColorTargets,
+    const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo,
+    Uint32 viewCount,
+    id<MTLRasterizationRateMap> rateMap)
 {
     @autoreleasepool {
         MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
@@ -2440,6 +2510,10 @@ static void METAL_INTERNAL_BeginRenderPass(
         SDL_GPUViewport viewport;
         SDL_Rect scissorRect;
         SDL_FColor blendConstants;
+
+        if (rateMap != nil && !METAL_INTERNAL_ValidateRateMap(renderer, rateMap, colorTargetInfos, numColorTargets, depthStencilTargetInfo, viewCount)) {
+            return false;
+        }
 
         for (Uint32 i = 0; i < numColorTargets; i += 1) {
             MetalTextureContainer *container = (MetalTextureContainer *)colorTargetInfos[i].texture;
@@ -2507,6 +2581,13 @@ static void METAL_INTERNAL_BeginRenderPass(
         if (viewCount > 1) {
             passDescriptor.renderTargetArrayLength = viewCount;
         }
+        if (rateMap != nil) {
+            if (@available(macOS 10.15.4, iOS 13.0, tvOS 16.0, *)) {
+                // The pass descriptor retains the map for the encoder's lifetime; the
+                // application keeps its own reference (__bridge, no ownership transfer).
+                passDescriptor.rasterizationRateMap = rateMap;
+            }
+        }
 
         metalCommandBuffer->renderEncoder = [metalCommandBuffer->handle renderCommandEncoderWithDescriptor:passDescriptor];
         metalCommandBuffer->renderPassViewCount = viewCount;
@@ -2558,6 +2639,22 @@ static void METAL_INTERNAL_BeginRenderPass(
             }
         }
 
+        // With a rasterization rate map, viewport and scissor are in the map's
+        // logical screen space, not in physical texture pixels.
+        if (rateMap != nil) {
+            if (@available(macOS 10.15.4, iOS 13.0, tvOS 16.0, *)) {
+                vpWidth = (Uint32)rateMap.screenSize.width;
+                vpHeight = (Uint32)rateMap.screenSize.height;
+            }
+            // The core derived its debug viewport limits from the texture sizes;
+            // replace them with the logical size so SDL_SetGPUViewport and
+            // SDL_SetGPUScissor validate against screen space.
+            if (renderer->sdlGPUDevice->debug_mode) {
+                renderer->sdlGPUDevice->max_viewport_width = vpWidth;
+                renderer->sdlGPUDevice->max_viewport_height = vpHeight;
+            }
+        }
+
         // Set sensible default states
         viewport.x = 0;
         viewport.y = 0;
@@ -2584,6 +2681,7 @@ static void METAL_INTERNAL_BeginRenderPass(
         METAL_SetStencilReference(
             commandBuffer,
             0);
+        return true;
     }
 }
 
@@ -2593,17 +2691,22 @@ static void METAL_BeginRenderPass(
     Uint32 numColorTargets,
     const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo)
 {
-    METAL_INTERNAL_BeginRenderPass(commandBuffer, colorTargetInfos, numColorTargets, depthStencilTargetInfo, 1);
+    METAL_INTERNAL_BeginRenderPass(commandBuffer, colorTargetInfos, numColorTargets, depthStencilTargetInfo, 1, nil);
 }
 
-static void METAL_BeginRenderPassWithViewCount(
+static bool METAL_BeginRenderPassWithProperties(
     SDL_GPUCommandBuffer *commandBuffer,
     const SDL_GPUColorTargetInfo *colorTargetInfos,
     Uint32 numColorTargets,
     const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo,
-    Uint32 viewCount)
+    Uint32 viewCount,
+    SDL_PropertiesID props)
 {
-    METAL_INTERNAL_BeginRenderPass(commandBuffer, colorTargetInfos, numColorTargets, depthStencilTargetInfo, viewCount);
+    id<MTLRasterizationRateMap> rateMap = (__bridge id<MTLRasterizationRateMap>)SDL_GetPointerProperty(
+        props,
+        SDL_PROP_GPU_RENDERPASS_CREATE_METAL_RASTERIZATION_RATE_MAP_POINTER,
+        NULL);
+    return METAL_INTERNAL_BeginRenderPass(commandBuffer, colorTargetInfos, numColorTargets, depthStencilTargetInfo, viewCount, rateMap);
 }
 
 static void METAL_BindGraphicsPipeline(
@@ -4961,7 +5064,7 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
         ASSIGN_DRIVER(METAL)
         // Optional multiview hooks (not part of ASSIGN_DRIVER)
         result->SupportsViewCount = METAL_SupportsViewCount;
-        result->BeginRenderPassWithViewCount = METAL_BeginRenderPassWithViewCount;
+        result->BeginRenderPassWithProperties = METAL_BeginRenderPassWithProperties;
         result->driverData = (SDL_GPURenderer *)renderer;
         result->shader_formats = SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_METALLIB;
         renderer->sdlGPUDevice = result;
