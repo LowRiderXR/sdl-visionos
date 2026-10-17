@@ -1353,3 +1353,5 @@ SDL_DYNAPI_PROC(SDL_PropertiesID,SDL_GetAudioDeviceProperties,(SDL_AudioDeviceID
 SDL_DYNAPI_PROC(bool,SDL_SetSoftwareRendererWindow,(SDL_Renderer *a,SDL_Window *b),(a,b),return)
 SDL_DYNAPI_PROC(bool,SDL_SetSoftwareRendererSurface,(SDL_Renderer *a,SDL_Surface *b),(a,b),return)
 SDL_DYNAPI_PROC(char*,SDL_EncodeURL,(const char *a,const char *b),(a,b),return)
+SDL_DYNAPI_PROC(SDL_GPURenderPass*,SDL_BeginGPURenderPassWithProperties,(SDL_GPUCommandBuffer *a,const SDL_GPUColorTargetInfo *b,Uint32 c,const SDL_GPUDepthStencilTargetInfo *d,SDL_PropertiesID e),(a,b,c,d,e),return)
+SDL_DYNAPI_PROC(bool,SDL_GPUSupportsViewCount,(SDL_GPUDevice *a,Uint32 b),(a,b),return)

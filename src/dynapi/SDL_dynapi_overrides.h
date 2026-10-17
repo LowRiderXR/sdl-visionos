@@ -1345,3 +1345,5 @@
 #define SDL_SetSoftwareRendererWindow SDL_SetSoftwareRendererWindow_REAL
 #define SDL_SetSoftwareRendererSurface SDL_SetSoftwareRendererSurface_REAL
 #define SDL_EncodeURL SDL_EncodeURL_REAL
+#define SDL_BeginGPURenderPassWithProperties SDL_BeginGPURenderPassWithProperties_REAL
+#define SDL_GPUSupportsViewCount SDL_GPUSupportsViewCount_REAL

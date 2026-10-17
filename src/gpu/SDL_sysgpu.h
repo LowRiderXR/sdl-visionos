@@ -70,6 +70,7 @@ typedef struct RenderPass
     SDL_GPUTexture *color_targets[MAX_COLOR_TARGET_BINDINGS];
     Uint32 num_color_targets;
     SDL_GPUTexture *depth_stencil_target;
+    Uint32 view_count; // multiview: views per draw, 1 when not in use
 
     SDL_GPUGraphicsPipeline *graphics_pipeline;
 
@@ -112,6 +113,8 @@ typedef struct GraphicsPipelineCommonHeader
     Uint32 num_fragment_storage_textures;
     Uint32 num_fragment_storage_buffers;
     Uint32 num_fragment_uniform_buffers;
+
+    Uint32 view_count; // multiview: 0 or 1 means a single view
 } GraphicsPipelineCommonHeader;
 
 typedef struct ComputePipelineCommonHeader
@@ -1109,6 +1112,20 @@ struct SDL_GPUDevice
         SDL_GPURenderer *driverData,
         SDL_GPUTextureFormat format,
         SDL_GPUSampleCount desiredSampleCount);
+
+    // Optional multiview support (NULL on backends without it; the core then
+    // only accepts a view count of 1). Not part of ASSIGN_DRIVER on purpose.
+
+    bool (*SupportsViewCount)(
+        SDL_GPURenderer *driverData,
+        Uint32 viewCount);
+
+    void (*BeginRenderPassWithViewCount)(
+        SDL_GPUCommandBuffer *commandBuffer,
+        const SDL_GPUColorTargetInfo *colorTargetInfos,
+        Uint32 numColorTargets,
+        const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo,
+        Uint32 viewCount);
 
     // Opaque pointer for the Driver
     SDL_GPURenderer *driverData;

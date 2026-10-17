@@ -981,6 +981,21 @@ bool SDL_GPUTextureSupportsSampleCount(
         sample_count);
 }
 
+bool SDL_GPUSupportsViewCount(
+    SDL_GPUDevice *device,
+    Uint32 view_count)
+{
+    CHECK_DEVICE_MAGIC(device, false);
+
+    if (view_count == 1) {
+        return true;
+    }
+    if (view_count == 0 || device->SupportsViewCount == NULL) {
+        return false;
+    }
+    return device->SupportsViewCount(device->driverData, view_count);
+}
+
 // State Creation
 
 SDL_GPUComputePipeline *SDL_CreateGPUComputePipeline(
@@ -1055,6 +1070,19 @@ SDL_GPUGraphicsPipeline *SDL_CreateGPUGraphicsPipeline(
     CHECK_PARAM(graphicsPipelineCreateInfo == NULL) {
         SDL_InvalidParamError("graphicsPipelineCreateInfo");
         return NULL;
+    }
+
+    // Multiview: the view count must be supported by backend and device.
+    {
+        const Sint64 viewCount = SDL_GetNumberProperty(graphicsPipelineCreateInfo->props, SDL_PROP_GPU_GRAPHICSPIPELINE_CREATE_VIEW_COUNT_NUMBER, 1);
+        if (viewCount < 1) {
+            SDL_SetError("SDL_PROP_GPU_GRAPHICSPIPELINE_CREATE_VIEW_COUNT_NUMBER must be at least 1");
+            return NULL;
+        }
+        if (viewCount > 1 && !SDL_GPUSupportsViewCount(device, (Uint32)viewCount)) {
+            SDL_SetError("A view count of %d is not supported by the %s backend on this device", (int)viewCount, device->backend);
+            return NULL;
+        }
     }
 
     if (device->debug_mode) {
@@ -1806,7 +1834,23 @@ SDL_GPURenderPass *SDL_BeginGPURenderPass(
     Uint32 num_color_targets,
     const SDL_GPUDepthStencilTargetInfo *depth_stencil_target_info)
 {
+    return SDL_BeginGPURenderPassWithProperties(
+        command_buffer,
+        color_target_infos,
+        num_color_targets,
+        depth_stencil_target_info,
+        0);
+}
+
+SDL_GPURenderPass *SDL_BeginGPURenderPassWithProperties(
+    SDL_GPUCommandBuffer *command_buffer,
+    const SDL_GPUColorTargetInfo *color_target_infos,
+    Uint32 num_color_targets,
+    const SDL_GPUDepthStencilTargetInfo *depth_stencil_target_info,
+    SDL_PropertiesID props)
+{
     CommandBufferCommonHeader *commandBufferHeader;
+    Uint32 view_count;
 
     CHECK_PARAM(command_buffer == NULL) {
         SDL_InvalidParamError("command_buffer");
@@ -1820,6 +1864,57 @@ SDL_GPURenderPass *SDL_BeginGPURenderPass(
     CHECK_PARAM(num_color_targets > MAX_COLOR_TARGET_BINDINGS) {
         SDL_SetError("num_color_targets exceeds MAX_COLOR_TARGET_BINDINGS");
         return NULL;
+    }
+
+    // Multiview: validate the view count against backend support and the layer
+    // counts of the targets. These checks run in every build, not only in debug
+    // mode, because a mismatch produces undefined GPU behavior.
+    {
+        const Sint64 requested = SDL_GetNumberProperty(props, SDL_PROP_GPU_RENDERPASS_CREATE_VIEW_COUNT_NUMBER, 1);
+        if (requested < 1) {
+            SDL_SetError("SDL_PROP_GPU_RENDERPASS_CREATE_VIEW_COUNT_NUMBER must be at least 1");
+            return NULL;
+        }
+        view_count = (Uint32)requested;
+        if (view_count > 1) {
+            if (COMMAND_BUFFER_DEVICE->BeginRenderPassWithViewCount == NULL ||
+                !SDL_GPUSupportsViewCount(COMMAND_BUFFER_DEVICE, view_count)) {
+                SDL_SetError("A view count of %u is not supported by the %s backend on this device", view_count, COMMAND_BUFFER_DEVICE->backend);
+                return NULL;
+            }
+            for (Uint32 i = 0; i < num_color_targets; i += 1) {
+                const TextureCommonHeader *textureHeader = (const TextureCommonHeader *)color_target_infos[i].texture;
+                if (textureHeader == NULL) {
+                    SDL_InvalidParamError("color_target_infos[].texture");
+                    return NULL;
+                }
+                if (textureHeader->info.type != SDL_GPU_TEXTURETYPE_2D_ARRAY && textureHeader->info.type != SDL_GPU_TEXTURETYPE_CUBE_ARRAY) {
+                    SDL_SetError("Color target %u must be a 2D array texture for a render pass with %u views", i, view_count);
+                    return NULL;
+                }
+                if (color_target_infos[i].layer_or_depth_plane + view_count > textureHeader->info.layer_count_or_depth) {
+                    SDL_SetError("Color target %u has %u layers, but layer %u plus %u views were requested", i,
+                                 textureHeader->info.layer_count_or_depth, color_target_infos[i].layer_or_depth_plane, view_count);
+                    return NULL;
+                }
+            }
+            if (depth_stencil_target_info != NULL) {
+                const TextureCommonHeader *textureHeader = (const TextureCommonHeader *)depth_stencil_target_info->texture;
+                if (textureHeader == NULL) {
+                    SDL_InvalidParamError("depth_stencil_target_info->texture");
+                    return NULL;
+                }
+                if (textureHeader->info.type != SDL_GPU_TEXTURETYPE_2D_ARRAY && textureHeader->info.type != SDL_GPU_TEXTURETYPE_CUBE_ARRAY) {
+                    SDL_SetError("The depth stencil target must be a 2D array texture for a render pass with %u views", view_count);
+                    return NULL;
+                }
+                if ((Uint32)depth_stencil_target_info->layer + view_count > textureHeader->info.layer_count_or_depth) {
+                    SDL_SetError("The depth stencil target has %u layers, but layer %u plus %u views were requested",
+                                 textureHeader->info.layer_count_or_depth, depth_stencil_target_info->layer, view_count);
+                    return NULL;
+                }
+            }
+        }
     }
 
     if (COMMAND_BUFFER_DEVICE->debug_mode) {
@@ -1907,13 +2002,23 @@ SDL_GPURenderPass *SDL_BeginGPURenderPass(
         }
     }
 
-    COMMAND_BUFFER_DEVICE->BeginRenderPass(
-        command_buffer,
-        color_target_infos,
-        num_color_targets,
-        depth_stencil_target_info);
+    if (view_count > 1) {
+        COMMAND_BUFFER_DEVICE->BeginRenderPassWithViewCount(
+            command_buffer,
+            color_target_infos,
+            num_color_targets,
+            depth_stencil_target_info,
+            view_count);
+    } else {
+        COMMAND_BUFFER_DEVICE->BeginRenderPass(
+            command_buffer,
+            color_target_infos,
+            num_color_targets,
+            depth_stencil_target_info);
+    }
 
     commandBufferHeader = (CommandBufferCommonHeader *)command_buffer;
+    commandBufferHeader->render_pass.view_count = view_count;
 
     if (COMMAND_BUFFER_DEVICE->debug_mode) {
         commandBufferHeader->render_pass.in_progress = true;
@@ -1942,6 +2047,24 @@ void SDL_BindGPUGraphicsPipeline(
     CHECK_PARAM(graphics_pipeline == NULL) {
         SDL_InvalidParamError("graphics_pipeline");
         return;
+    }
+
+    // Multiview: the pipeline's view count must match the pass. Checked in every
+    // build because a mismatch is undefined on the GPU; the pass keeps its
+    // previous pipeline (or none) and the error is available via SDL_GetError().
+    {
+        Uint32 pipelineViews = ((GraphicsPipelineCommonHeader *)graphics_pipeline)->view_count;
+        Uint32 passViews = ((RenderPass *)render_pass)->view_count;
+        if (pipelineViews == 0) {
+            pipelineViews = 1;
+        }
+        if (passViews == 0) {
+            passViews = 1;
+        }
+        if (pipelineViews != passViews) {
+            SDL_SetError("The graphics pipeline renders %u views, but the render pass was begun with %u views", pipelineViews, passViews);
+            return;
+        }
     }
 
     RENDERPASS_DEVICE->BindGraphicsPipeline(

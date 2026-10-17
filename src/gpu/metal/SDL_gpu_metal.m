@@ -495,6 +495,7 @@ typedef struct MetalGraphicsPipeline
     SDL_GPUPrimitiveType primitiveType;
 
     id<MTLDepthStencilState> depth_stencil_state;
+    Uint32 viewCount; // multiview via vertex amplification, 1 = off
 } MetalGraphicsPipeline;
 
 typedef struct MetalComputePipeline
@@ -549,6 +550,7 @@ typedef struct MetalCommandBuffer
 
     // Render Pass
     id<MTLRenderCommandEncoder> renderEncoder;
+    Uint32 renderPassViewCount; // multiview views of the current pass, 1 = off
     MetalGraphicsPipeline *graphics_pipeline;
     MetalBuffer *indexBuffer;
     Uint32 indexBufferOffset;
@@ -1229,6 +1231,35 @@ static SDL_GPUGraphicsPipeline *METAL_CreateGraphicsPipeline(
             pipelineDescriptor.label = @(name);
         }
 
+        // Multiview: the view count is the vertex amplification maximum of the
+        // pipeline. The core already checked SupportsViewCount.
+        Uint32 viewCount = (Uint32)SDL_GetNumberProperty(createinfo->props, SDL_PROP_GPU_GRAPHICSPIPELINE_CREATE_VIEW_COUNT_NUMBER, 1);
+        if (viewCount < 1) {
+            viewCount = 1;
+        }
+        if (viewCount > 1) {
+            if (@available(macOS 10.15.4, iOS 13.0, tvOS 13.0, *)) {
+                pipelineDescriptor.maxVertexAmplificationCount = viewCount;
+            } else {
+                SET_STRING_ERROR_AND_RETURN("Vertex amplification is not available on this OS version", NULL);
+            }
+            // Layered rendering: Metal requires the topology class when the vertex
+            // shader can write [[render_target_array_index]] (SPIRV-Cross emits it
+            // for shaders that read the view index).
+            switch (createinfo->primitive_type) {
+            case SDL_GPU_PRIMITIVETYPE_POINTLIST:
+                pipelineDescriptor.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint;
+                break;
+            case SDL_GPU_PRIMITIVETYPE_LINELIST:
+            case SDL_GPU_PRIMITIVETYPE_LINESTRIP:
+                pipelineDescriptor.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine;
+                break;
+            default:
+                pipelineDescriptor.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+                break;
+            }
+        }
+
         // Create the graphics pipeline
 
         pipelineState = [renderer->device newRenderPipelineStateWithDescriptor:pipelineDescriptor error:&error];
@@ -1241,6 +1272,8 @@ static SDL_GPUGraphicsPipeline *METAL_CreateGraphicsPipeline(
         result->depth_stencil_state = depthStencilState;
         result->rasterizerState = createinfo->rasterizer_state;
         result->primitiveType = createinfo->primitive_type;
+        result->viewCount = viewCount;
+        result->header.view_count = viewCount;
         result->header.num_vertex_samplers = vertexShader->numSamplers;
         result->header.num_vertex_uniform_buffers = vertexShader->numUniformBuffers;
         result->header.num_vertex_storage_buffers = vertexShader->numStorageBuffers;
@@ -1506,6 +1539,24 @@ static bool METAL_SupportsSampleCount(
         MetalRenderer *renderer = (MetalRenderer *)driverData;
         NSUInteger mtlSampleCount = SDLToMetal_SampleCount[sampleCount];
         return [renderer->device supportsTextureSampleCount:mtlSampleCount];
+    }
+}
+
+// Multiview: one draw renders viewCount views through vertex amplification,
+// view i landing in render target layer (base slice + i).
+static bool METAL_SupportsViewCount(
+    SDL_GPURenderer *driverData,
+    Uint32 viewCount)
+{
+    @autoreleasepool {
+        MetalRenderer *renderer = (MetalRenderer *)driverData;
+        if (viewCount == 1) {
+            return true;
+        }
+        if (@available(macOS 10.15.4, iOS 13.0, tvOS 13.0, *)) {
+            return [renderer->device supportsVertexAmplificationCount:viewCount];
+        }
+        return false;
     }
 }
 
@@ -2370,11 +2421,15 @@ static void METAL_SetStencilReference(
     }
 }
 
-static void METAL_BeginRenderPass(
+// viewCount > 1: multiview. The pass covers layers (slice .. slice + viewCount - 1)
+// of every target through renderTargetArrayLength, and the encoder maps
+// amplified vertex i to render target layer offset i (one shared viewport).
+static void METAL_INTERNAL_BeginRenderPass(
     SDL_GPUCommandBuffer *commandBuffer,
     const SDL_GPUColorTargetInfo *colorTargetInfos,
     Uint32 numColorTargets,
-    const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo)
+    const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo,
+    Uint32 viewCount)
 {
     @autoreleasepool {
         MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
@@ -2449,7 +2504,30 @@ static void METAL_BeginRenderPass(
             METAL_INTERNAL_TrackTexture(metalCommandBuffer, texture);
         }
 
+        if (viewCount > 1) {
+            passDescriptor.renderTargetArrayLength = viewCount;
+        }
+
         metalCommandBuffer->renderEncoder = [metalCommandBuffer->handle renderCommandEncoderWithDescriptor:passDescriptor];
+        metalCommandBuffer->renderPassViewCount = viewCount;
+
+        if (viewCount > 1) {
+            if (@available(macOS 10.15.4, iOS 13.0, tvOS 13.0, *)) {
+                // One viewport for all views: every view renders the full layer, so the
+                // viewport the pass sets (or SDL_SetGPUViewport) applies to all of them and
+                // viewportArrayIndexOffset stays 0. This matches layered stereo targets, where
+                // the views share one logical viewport and one rasterization rate map
+                // (visionOS .layered layout, measured: both views viewport 0,0 5087x4081 with a
+                // shared two-layer map). Only the render target layer differs per view.
+                MTLVertexAmplificationViewMapping mappings[8];
+                Uint32 mappingCount = SDL_min(viewCount, (Uint32)SDL_arraysize(mappings));
+                for (Uint32 i = 0; i < mappingCount; i += 1) {
+                    mappings[i].viewportArrayIndexOffset = 0;
+                    mappings[i].renderTargetArrayIndexOffset = i;
+                }
+                [metalCommandBuffer->renderEncoder setVertexAmplificationCount:mappingCount viewMappings:mappings];
+            }
+        }
 
         // The viewport cannot be larger than the smallest target.
         for (Uint32 i = 0; i < numColorTargets; i += 1) {
@@ -2507,6 +2585,25 @@ static void METAL_BeginRenderPass(
             commandBuffer,
             0);
     }
+}
+
+static void METAL_BeginRenderPass(
+    SDL_GPUCommandBuffer *commandBuffer,
+    const SDL_GPUColorTargetInfo *colorTargetInfos,
+    Uint32 numColorTargets,
+    const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo)
+{
+    METAL_INTERNAL_BeginRenderPass(commandBuffer, colorTargetInfos, numColorTargets, depthStencilTargetInfo, 1);
+}
+
+static void METAL_BeginRenderPassWithViewCount(
+    SDL_GPUCommandBuffer *commandBuffer,
+    const SDL_GPUColorTargetInfo *colorTargetInfos,
+    Uint32 numColorTargets,
+    const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo,
+    Uint32 viewCount)
+{
+    METAL_INTERNAL_BeginRenderPass(commandBuffer, colorTargetInfos, numColorTargets, depthStencilTargetInfo, viewCount);
 }
 
 static void METAL_BindGraphicsPipeline(
@@ -4862,6 +4959,9 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
 
         SDL_GPUDevice *result = SDL_calloc(1, sizeof(SDL_GPUDevice));
         ASSIGN_DRIVER(METAL)
+        // Optional multiview hooks (not part of ASSIGN_DRIVER)
+        result->SupportsViewCount = METAL_SupportsViewCount;
+        result->BeginRenderPassWithViewCount = METAL_BeginRenderPassWithViewCount;
         result->driverData = (SDL_GPURenderer *)renderer;
         result->shader_formats = SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_METALLIB;
         renderer->sdlGPUDevice = result;

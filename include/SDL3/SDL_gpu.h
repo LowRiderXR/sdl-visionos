@@ -2897,6 +2897,18 @@ extern SDL_DECLSPEC SDL_GPUComputePipeline * SDLCALL SDL_CreateGPUComputePipelin
  *
  * - `SDL_PROP_GPU_GRAPHICSPIPELINE_CREATE_NAME_STRING`: a name that can be
  *   displayed in debugging tools.
+ * - `SDL_PROP_GPU_GRAPHICSPIPELINE_CREATE_VIEW_COUNT_NUMBER`: the number of
+ *   views the pipeline renders in a single draw (multiview). Defaults to 1. A
+ *   pipeline with a view count above 1 may only be bound in a render pass
+ *   that was begun with the same view count through
+ *   SDL_BeginGPURenderPassWithProperties; the pass then writes view `i` to
+ *   layer `layer_or_depth_plane + i` of its 2D array targets. Check
+ *   SDL_GPUSupportsViewCount before requesting more than one view; creation
+ *   fails on backends and devices without support. Shader convention: the
+ *   vertex shader reads the view index (HLSL `SV_ViewID`, SPIR-V
+ *   `ViewIndex`, MSL `[[amplification_id]]`) and indexes a per-view array
+ *   (for example the view-projection matrices) in its uniform data with it.
+ *   On Metal this maps to vertex amplification.
  *
  * \param device a GPU Context.
  * \param createinfo a struct describing the state of the graphics pipeline to
@@ -2915,6 +2927,7 @@ extern SDL_DECLSPEC SDL_GPUGraphicsPipeline * SDLCALL SDL_CreateGPUGraphicsPipel
     const SDL_GPUGraphicsPipelineCreateInfo *createinfo);
 
 #define SDL_PROP_GPU_GRAPHICSPIPELINE_CREATE_NAME_STRING "SDL.gpu.graphicspipeline.create.name"
+#define SDL_PROP_GPU_GRAPHICSPIPELINE_CREATE_VIEW_COUNT_NUMBER "SDL.gpu.graphicspipeline.create.view_count"
 
 /**
  * Creates a sampler object to be used when binding textures in a graphics
@@ -3680,6 +3693,54 @@ extern SDL_DECLSPEC SDL_GPURenderPass * SDLCALL SDL_BeginGPURenderPass(
     const SDL_GPUColorTargetInfo *color_target_infos,
     Uint32 num_color_targets,
     const SDL_GPUDepthStencilTargetInfo *depth_stencil_target_info);
+
+/**
+ * Begins a render pass on a command buffer, with additional properties.
+ *
+ * This behaves like SDL_BeginGPURenderPass; see there for the rules on
+ * targets, load and store ops. The properties allow features that have no
+ * field in the target info structures:
+ *
+ * - `SDL_PROP_GPU_RENDERPASS_CREATE_VIEW_COUNT_NUMBER`: the number of views
+ *   rendered by every draw in this pass (multiview). Defaults to 1. With a
+ *   view count N above 1, every color target and the depth stencil target
+ *   must be 2D array textures, and view `i` is written to layer
+ *   `layer_or_depth_plane + i` (color) and `layer + i` (depth stencil), so
+ *   `layer + N` must not exceed the layer count of each target. Only
+ *   graphics pipelines created with the same
+ *   `SDL_PROP_GPU_GRAPHICSPIPELINE_CREATE_VIEW_COUNT_NUMBER` can be bound in
+ *   the pass; binding another pipeline fails and leaves the pass without a
+ *   pipeline. The view index reaches the vertex shader through the shader
+ *   convention described for that property. Beginning a pass with more than
+ *   one view fails on backends and devices without support; check
+ *   SDL_GPUSupportsViewCount first.
+ *
+ * \param command_buffer a command buffer.
+ * \param color_target_infos an array of texture subresources with
+ *                           corresponding clear values and load/store ops.
+ * \param num_color_targets the number of color targets in the
+ *                          color_target_infos array.
+ * \param depth_stencil_target_info a texture subresource with corresponding
+ *                                  clear value and load/store ops, may be
+ *                                  NULL.
+ * \param props the properties to use, or 0 for none.
+ * \returns a render pass handle, or NULL on failure; call SDL_GetError() for
+ *          more information.
+ *
+ * \since This function is available since SDL 3.6.0.
+ *
+ * \sa SDL_BeginGPURenderPass
+ * \sa SDL_EndGPURenderPass
+ * \sa SDL_GPUSupportsViewCount
+ */
+extern SDL_DECLSPEC SDL_GPURenderPass * SDLCALL SDL_BeginGPURenderPassWithProperties(
+    SDL_GPUCommandBuffer *command_buffer,
+    const SDL_GPUColorTargetInfo *color_target_infos,
+    Uint32 num_color_targets,
+    const SDL_GPUDepthStencilTargetInfo *depth_stencil_target_info,
+    SDL_PropertiesID props);
+
+#define SDL_PROP_GPU_RENDERPASS_CREATE_VIEW_COUNT_NUMBER "SDL.gpu.renderpass.create.view_count"
 
 /**
  * Binds a graphics pipeline on a render pass to be used in rendering.
@@ -4954,6 +5015,26 @@ extern SDL_DECLSPEC bool SDLCALL SDL_GPUTextureSupportsSampleCount(
     SDL_GPUDevice *device,
     SDL_GPUTextureFormat format,
     SDL_GPUSampleCount sample_count);
+
+/**
+ * Determines if a view count for multiview rendering is supported.
+ *
+ * A view count of 1 is always supported. Higher counts require backend and
+ * device support (on Metal: vertex amplification); see
+ * `SDL_PROP_GPU_GRAPHICSPIPELINE_CREATE_VIEW_COUNT_NUMBER` and
+ * `SDL_PROP_GPU_RENDERPASS_CREATE_VIEW_COUNT_NUMBER`.
+ *
+ * \param device a GPU context.
+ * \param view_count the number of views to check.
+ * \returns whether draws can render this many views at once.
+ *
+ * \since This function is available since SDL 3.6.0.
+ *
+ * \sa SDL_BeginGPURenderPassWithProperties
+ */
+extern SDL_DECLSPEC bool SDLCALL SDL_GPUSupportsViewCount(
+    SDL_GPUDevice *device,
+    Uint32 view_count);
 
 /**
  * Calculate the size in bytes of a texture format with dimensions.
