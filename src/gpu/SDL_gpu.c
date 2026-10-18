@@ -1395,13 +1395,9 @@ SDL_GPUTexture *SDL_CreateGPUTexture(
                 failed = true;
             }
         } else {
-            if (createinfo->type == SDL_GPU_TEXTURETYPE_2D_ARRAY) {
-                // Array Texture Validation
-                if (createinfo->sample_count > SDL_GPU_SAMPLECOUNT_1) {
-                    SDL_assert_release(!"For array textures: sample_count must be SDL_GPU_SAMPLECOUNT_1");
-                    failed = true;
-                }
-            }
+            // 2D array textures may be multisample (Metal: MTLTextureType2DMultisampleArray,
+            // Vulkan and D3D12 set sample count and layer count independently); a
+            // multiview pass renders into them and resolves into a layered target.
             if (createinfo->sample_count > SDL_GPU_SAMPLECOUNT_1 && createinfo->num_levels > 1) {
                 SDL_assert_release(!"For 2D multisample textures: num_levels must be 1");
                 failed = true;
@@ -1879,6 +1875,11 @@ SDL_GPURenderPass *SDL_BeginGPURenderPassWithProperties(
         if (SDL_HasProperty(props, SDL_PROP_GPU_RENDERPASS_CREATE_METAL_RASTERIZATION_RATE_MAP_POINTER) &&
             COMMAND_BUFFER_DEVICE->BeginRenderPassWithProperties == NULL) {
             SDL_SetError("A rasterization rate map is not supported by the %s backend", COMMAND_BUFFER_DEVICE->backend);
+            return NULL;
+        }
+        if (SDL_HasProperty(props, SDL_PROP_GPU_RENDERPASS_CREATE_METAL_DEPTH_RESOLVE_TEXTURE_POINTER) &&
+            COMMAND_BUFFER_DEVICE->BeginRenderPassWithProperties == NULL) {
+            SDL_SetError("A depth resolve texture is not supported by the %s backend", COMMAND_BUFFER_DEVICE->backend);
             return NULL;
         }
         if (view_count > 1) {

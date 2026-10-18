@@ -386,6 +386,11 @@ static MTLTextureType SDLToMetal_TextureType(SDL_GPUTextureType textureType, boo
     case SDL_GPU_TEXTURETYPE_2D:
         return isMSAA ? MTLTextureType2DMultisample : MTLTextureType2D;
     case SDL_GPU_TEXTURETYPE_2D_ARRAY:
+        if (isMSAA) {
+            if (@available(macOS 10.14, iOS 14.0, tvOS 16.0, *)) {
+                return MTLTextureType2DMultisampleArray;
+            }
+        }
         return MTLTextureType2DArray;
     case SDL_GPU_TEXTURETYPE_3D:
         return MTLTextureType3D;
@@ -643,6 +648,11 @@ struct MetalRenderer
     bool debugMode;
     SDL_PropertiesID props;
     Uint32 allowedFramesInFlight;
+
+    // Optional: the application is told about every completed command buffer
+    // (SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_BUFFER_COMPLETED_CALLBACK_POINTER).
+    SDL_GPUMetalCommandBufferCompletedCallback commandBufferCompletedCallback;
+    void *commandBufferCompletedUserdata;
 
     MetalWindowData **claimedWindows;
     Uint32 claimedWindowCount;
@@ -2488,18 +2498,99 @@ static bool METAL_INTERNAL_ValidateRateMap(
     return false;
 }
 
+// Depth multisample resolve requested through render pass properties (see
+// SDL_PROP_GPU_RENDERPASS_CREATE_METAL_DEPTH_RESOLVE_TEXTURE_POINTER).
+typedef struct MetalDepthResolve
+{
+    MetalTextureContainer *container; // NULL: no depth resolve
+    Uint32 layer;
+    MTLMultisampleDepthResolveFilter filter;
+} MetalDepthResolve;
+
+// Reads and validates the depth resolve properties against the depth stencil
+// target. Returns false with an SDL error set.
+static bool METAL_INTERNAL_ReadDepthResolve(
+    const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo,
+    Uint32 viewCount,
+    SDL_PropertiesID props,
+    MetalDepthResolve *out)
+{
+    SDL_zerop(out);
+    if (props == 0) {
+        return true;
+    }
+    out->container = (MetalTextureContainer *)SDL_GetPointerProperty(props, SDL_PROP_GPU_RENDERPASS_CREATE_METAL_DEPTH_RESOLVE_TEXTURE_POINTER, NULL);
+    if (out->container == NULL) {
+        return true;
+    }
+    out->layer = (Uint32)SDL_GetNumberProperty(props, SDL_PROP_GPU_RENDERPASS_CREATE_METAL_DEPTH_RESOLVE_LAYER_NUMBER, 0);
+    const char *filter = SDL_GetStringProperty(props, SDL_PROP_GPU_RENDERPASS_CREATE_METAL_DEPTH_RESOLVE_FILTER_STRING, "sample0");
+    if (SDL_strcmp(filter, "sample0") == 0) {
+        out->filter = MTLMultisampleDepthResolveFilterSample0;
+    } else if (SDL_strcmp(filter, "min") == 0) {
+        out->filter = MTLMultisampleDepthResolveFilterMin;
+    } else if (SDL_strcmp(filter, "max") == 0) {
+        out->filter = MTLMultisampleDepthResolveFilterMax;
+    } else {
+        SDL_SetError("Unknown depth resolve filter \"%s\" (expected \"sample0\", \"min\" or \"max\")", filter);
+        return false;
+    }
+    if (depthStencilTargetInfo == NULL) {
+        SDL_SetError("A depth resolve texture was given, but the render pass has no depth stencil target");
+        return false;
+    }
+    const SDL_GPUTextureCreateInfo *target = &((const TextureCommonHeader *)depthStencilTargetInfo->texture)->info;
+    const SDL_GPUTextureCreateInfo *resolve = &out->container->header.info;
+    if (target->sample_count == SDL_GPU_SAMPLECOUNT_1) {
+        SDL_SetError("A depth resolve texture was given, but the depth stencil target is not multisample");
+        return false;
+    }
+    if (IsStencilFormat(target->format)) {
+        SDL_SetError("Depth resolve is not supported for depth stencil targets with a stencil component");
+        return false;
+    }
+    if (resolve->sample_count != SDL_GPU_SAMPLECOUNT_1) {
+        SDL_SetError("The depth resolve texture must have a sample count of 1");
+        return false;
+    }
+    if (resolve->format != target->format) {
+        SDL_SetError("The depth resolve texture has format %d, but the depth stencil target has format %d", (int)resolve->format, (int)target->format);
+        return false;
+    }
+    if (!(resolve->usage & SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET)) {
+        SDL_SetError("The depth resolve texture must have been created with the DEPTH_STENCIL_TARGET usage flag");
+        return false;
+    }
+    if (resolve->type == SDL_GPU_TEXTURETYPE_3D) {
+        SDL_SetError("The depth resolve texture must not be a 3D texture");
+        return false;
+    }
+    Uint32 targetWidth = target->width >> depthStencilTargetInfo->mip_level;
+    Uint32 targetHeight = target->height >> depthStencilTargetInfo->mip_level;
+    if (resolve->width != targetWidth || resolve->height != targetHeight) {
+        SDL_SetError("The depth resolve texture is %ux%u, but the depth stencil target is %ux%u", resolve->width, resolve->height, targetWidth, targetHeight);
+        return false;
+    }
+    Uint32 resolveLayers = (resolve->type == SDL_GPU_TEXTURETYPE_2D) ? 1 : resolve->layer_count_or_depth;
+    if (out->layer + viewCount > resolveLayers) {
+        SDL_SetError("The depth resolve texture has %u layers, but layer %u plus %u views were requested", resolveLayers, out->layer, viewCount);
+        return false;
+    }
+    return true;
+}
+
 // viewCount > 1: multiview. The pass covers layers (slice .. slice + viewCount - 1)
 // of every target through renderTargetArrayLength, and the encoder maps
 // amplified vertex i to render target layer offset i (one shared viewport).
-// rateMap != nil: variable rasterization rate; viewport and scissor are then in
-// the map's logical screen space (screenSize), view i uses map layer i.
+// props: optional rasterization rate map (viewport and scissor are then in the
+// map's logical screen space, view i uses map layer i) and depth resolve.
 static bool METAL_INTERNAL_BeginRenderPass(
     SDL_GPUCommandBuffer *commandBuffer,
     const SDL_GPUColorTargetInfo *colorTargetInfos,
     Uint32 numColorTargets,
     const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo,
     Uint32 viewCount,
-    id<MTLRasterizationRateMap> rateMap)
+    SDL_PropertiesID props)
 {
     @autoreleasepool {
         MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
@@ -2510,8 +2601,20 @@ static bool METAL_INTERNAL_BeginRenderPass(
         SDL_GPUViewport viewport;
         SDL_Rect scissorRect;
         SDL_FColor blendConstants;
+        id<MTLRasterizationRateMap> rateMap = nil;
+        MetalDepthResolve depthResolve;
 
+        if (props != 0) {
+            // __bridge: no ownership transfer, the application keeps its reference.
+            rateMap = (__bridge id<MTLRasterizationRateMap>)SDL_GetPointerProperty(
+                props,
+                SDL_PROP_GPU_RENDERPASS_CREATE_METAL_RASTERIZATION_RATE_MAP_POINTER,
+                NULL);
+        }
         if (rateMap != nil && !METAL_INTERNAL_ValidateRateMap(renderer, rateMap, colorTargetInfos, numColorTargets, depthStencilTargetInfo, viewCount)) {
+            return false;
+        }
+        if (!METAL_INTERNAL_ReadDepthResolve(depthStencilTargetInfo, viewCount, props, &depthResolve)) {
             return false;
         }
 
@@ -2567,6 +2670,24 @@ static bool METAL_INTERNAL_BeginRenderPass(
             passDescriptor.depthAttachment.loadAction = SDLToMetal_LoadOp[depthStencilTargetInfo->load_op];
             passDescriptor.depthAttachment.storeAction = SDLToMetal_StoreOp[depthStencilTargetInfo->store_op];
             passDescriptor.depthAttachment.clearDepth = depthStencilTargetInfo->clear_depth;
+
+            if (depthResolve.container != NULL) {
+                // Depth resolve from the pass properties: STORE keeps the multisample
+                // contents as well, every other store op discards them after the resolve.
+                MetalTexture *resolveTexture = METAL_INTERNAL_PrepareTextureForWrite(
+                    renderer,
+                    depthResolve.container,
+                    false);
+                passDescriptor.depthAttachment.resolveTexture = resolveTexture->handle;
+                passDescriptor.depthAttachment.resolveSlice = depthResolve.layer;
+                passDescriptor.depthAttachment.resolveLevel = 0;
+                passDescriptor.depthAttachment.depthResolveFilter = depthResolve.filter;
+                passDescriptor.depthAttachment.storeAction =
+                    (depthStencilTargetInfo->store_op == SDL_GPU_STOREOP_STORE)
+                        ? MTLStoreActionStoreAndMultisampleResolve
+                        : MTLStoreActionMultisampleResolve;
+                METAL_INTERNAL_TrackTexture(metalCommandBuffer, resolveTexture);
+            }
 
             if (IsStencilFormat(container->header.info.format)) {
                 passDescriptor.stencilAttachment.texture = texture->handle;
@@ -2691,7 +2812,7 @@ static void METAL_BeginRenderPass(
     Uint32 numColorTargets,
     const SDL_GPUDepthStencilTargetInfo *depthStencilTargetInfo)
 {
-    METAL_INTERNAL_BeginRenderPass(commandBuffer, colorTargetInfos, numColorTargets, depthStencilTargetInfo, 1, nil);
+    METAL_INTERNAL_BeginRenderPass(commandBuffer, colorTargetInfos, numColorTargets, depthStencilTargetInfo, 1, 0);
 }
 
 static bool METAL_BeginRenderPassWithProperties(
@@ -2702,11 +2823,7 @@ static bool METAL_BeginRenderPassWithProperties(
     Uint32 viewCount,
     SDL_PropertiesID props)
 {
-    id<MTLRasterizationRateMap> rateMap = (__bridge id<MTLRasterizationRateMap>)SDL_GetPointerProperty(
-        props,
-        SDL_PROP_GPU_RENDERPASS_CREATE_METAL_RASTERIZATION_RATE_MAP_POINTER,
-        NULL);
-    return METAL_INTERNAL_BeginRenderPass(commandBuffer, colorTargetInfos, numColorTargets, depthStencilTargetInfo, viewCount, rateMap);
+    return METAL_INTERNAL_BeginRenderPass(commandBuffer, colorTargetInfos, numColorTargets, depthStencilTargetInfo, viewCount, props);
 }
 
 static void METAL_BindGraphicsPipeline(
@@ -4408,6 +4525,15 @@ static bool METAL_INTERNAL_Submit(
             windowData->frameCounter = (windowData->frameCounter + 1) % renderer->allowedFramesInFlight;
         }
 
+        // Tell the application when the GPU is done with this command buffer
+        if (renderer->commandBufferCompletedCallback != NULL) {
+            SDL_GPUMetalCommandBufferCompletedCallback callback = renderer->commandBufferCompletedCallback;
+            void *userdata = renderer->commandBufferCompletedUserdata;
+            [metalCommandBuffer->handle addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                callback(userdata, (__bridge void *)completed);
+            }];
+        }
+
         // Submit the command buffer
         [metalCommandBuffer->handle commit];
         metalCommandBuffer->handle = nil;
@@ -5002,6 +5128,16 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
         // Remember debug mode
         renderer->debugMode = debugMode;
         renderer->allowedFramesInFlight = 2;
+
+        // Optional completion callback for every submitted command buffer
+        renderer->commandBufferCompletedCallback = (SDL_GPUMetalCommandBufferCompletedCallback)SDL_GetPointerProperty(
+            props,
+            SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_BUFFER_COMPLETED_CALLBACK_POINTER,
+            NULL);
+        renderer->commandBufferCompletedUserdata = SDL_GetPointerProperty(
+            props,
+            SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_BUFFER_COMPLETED_USERDATA_POINTER,
+            NULL);
 
         // Set up colorspace array
         SwapchainCompositionToColorSpace[0] = kCGColorSpaceSRGB;

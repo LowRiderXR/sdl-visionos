@@ -1796,7 +1796,7 @@ typedef struct SDL_GPUTextureCreateInfo
     Uint32 height;                    /**< The height of the texture. */
     Uint32 layer_count_or_depth;      /**< The layer count or depth of the texture. This value is treated as a layer count on 2D array textures, and as a depth value on 3D textures. */
     Uint32 num_levels;                /**< The number of mip levels in the texture. */
-    SDL_GPUSampleCount sample_count;  /**< The number of samples per texel. Only applies if the texture is used as a render target. */
+    SDL_GPUSampleCount sample_count;  /**< The number of samples per texel. Only applies if the texture is used as a render target. 2D and 2D array textures may be multisample (a multisample 2D array is the render target of a multiview pass that resolves into layered targets). */
 
     SDL_PropertiesID props;           /**< A properties ID for extensions. Should be 0 if no extensions are needed. */
 } SDL_GPUTextureCreateInfo;
@@ -2396,6 +2396,15 @@ extern SDL_DECLSPEC SDL_GPUDevice * SDLCALL SDL_CreateGPUDevice(
  *   `SDL_PROP_GPU_DEVICE_CREATE_METAL_DEVICE_POINTER` is also set and does
  *   not match the queue's device, device creation fails. Ownership is as for
  *   the device pointer. Defaults to NULL.
+ * - `SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_BUFFER_COMPLETED_CALLBACK_POINTER`:
+ *   an SDL_GPUMetalCommandBufferCompletedCallback that is called once for
+ *   every command buffer the GPU device submits, after the GPU has finished
+ *   it, with the `id<MTLCommandBuffer>` as a `void *`. Use it to read
+ *   `GPUStartTime`, `GPUEndTime`, `status` and `error`. The callback runs on
+ *   a Metal completion thread, must not block, and must not keep the command
+ *   buffer beyond the call. Defaults to NULL.
+ * - `SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_BUFFER_COMPLETED_USERDATA_POINTER`:
+ *   the userdata passed to that callback. Defaults to NULL.
  *
  * \param props the properties to use.
  * \returns a GPU context on success or NULL on failure; call SDL_GetError()
@@ -2434,6 +2443,26 @@ extern SDL_DECLSPEC SDL_GPUDevice * SDLCALL SDL_CreateGPUDeviceWithProperties(
 #define SDL_PROP_GPU_DEVICE_CREATE_METAL_ALLOW_MACFAMILY1_BOOLEAN               "SDL.gpu.device.create.metal.allowmacfamily1"
 #define SDL_PROP_GPU_DEVICE_CREATE_METAL_DEVICE_POINTER                         "SDL.gpu.device.create.metal.device"
 #define SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_QUEUE_POINTER                  "SDL.gpu.device.create.metal.command_queue"
+#define SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_BUFFER_COMPLETED_CALLBACK_POINTER "SDL.gpu.device.create.metal.command_buffer_completed_callback"
+#define SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_BUFFER_COMPLETED_USERDATA_POINTER "SDL.gpu.device.create.metal.command_buffer_completed_userdata"
+
+/**
+ * A callback the Metal backend calls after the GPU has completed one of its
+ * command buffers.
+ *
+ * \param userdata the pointer passed in
+ *                 `SDL_PROP_GPU_DEVICE_CREATE_METAL_COMMAND_BUFFER_COMPLETED_USERDATA_POINTER`.
+ * \param mtl_command_buffer the completed `id<MTLCommandBuffer>` as a `void *`,
+ *                           valid only during the call.
+ *
+ * \threadsafety Called on a Metal completion thread, possibly concurrently
+ *               with other callbacks.
+ *
+ * \since This datatype is available since SDL 3.6.0.
+ *
+ * \sa SDL_CreateGPUDeviceWithProperties
+ */
+typedef void (SDLCALL *SDL_GPUMetalCommandBufferCompletedCallback)(void *userdata, void *mtl_command_buffer);
 
 #define SDL_PROP_GPU_DEVICE_CREATE_XR_ENABLE_BOOLEAN                            "SDL.gpu.device.create.xr.enable"
 #define SDL_PROP_GPU_DEVICE_CREATE_XR_INSTANCE_POINTER                          "SDL.gpu.device.create.xr.instance_out"
@@ -3740,6 +3769,26 @@ extern SDL_DECLSPEC SDL_GPURenderPass * SDLCALL SDL_BeginGPURenderPass(
  *   retains the map only for the duration of the pass; the application keeps
  *   ownership. Fails on backends and devices without support. Defaults to
  *   NULL.
+ * - `SDL_PROP_GPU_RENDERPASS_CREATE_METAL_DEPTH_RESOLVE_TEXTURE_POINTER`: an
+ *   `SDL_GPUTexture *` that receives the multisample resolve of the depth
+ *   stencil target at the end of the pass (depth only; SDL_GPUDepthStencilTargetInfo
+ *   has no resolve field, so the resolve target is given here). The depth
+ *   stencil target must be multisample and must not have a stencil
+ *   component; the resolve texture must have a sample count of 1, the same
+ *   format and size as the depth stencil target and the DEPTH_STENCIL_TARGET
+ *   usage. The depth store op of the target then becomes a resolve: with
+ *   `SDL_GPU_STOREOP_STORE` the multisample contents are stored and resolved,
+ *   with any other store op they are resolved and discarded. With more than
+ *   one view, view `i` is resolved into layer `resolve layer + i` of the
+ *   resolve texture, which therefore needs enough layers. Only the Metal
+ *   backend implements this; other backends fail the pass. Defaults to NULL.
+ * - `SDL_PROP_GPU_RENDERPASS_CREATE_METAL_DEPTH_RESOLVE_LAYER_NUMBER`: the
+ *   first layer of the depth resolve texture to resolve into. Defaults to 0.
+ * - `SDL_PROP_GPU_RENDERPASS_CREATE_METAL_DEPTH_RESOLVE_FILTER_STRING`: which
+ *   sample the depth resolve keeps per pixel: "sample0" (the Metal default),
+ *   "min" or "max". With a reversed-Z depth buffer (larger values are
+ *   nearer), "max" keeps the nearest surface, which attaches edge pixels to
+ *   the foreground object they belong to visually. Defaults to "sample0".
  *
  * \param command_buffer a command buffer.
  * \param color_target_infos an array of texture subresources with
@@ -3768,6 +3817,9 @@ extern SDL_DECLSPEC SDL_GPURenderPass * SDLCALL SDL_BeginGPURenderPassWithProper
 
 #define SDL_PROP_GPU_RENDERPASS_CREATE_VIEW_COUNT_NUMBER "SDL.gpu.renderpass.create.view_count"
 #define SDL_PROP_GPU_RENDERPASS_CREATE_METAL_RASTERIZATION_RATE_MAP_POINTER "SDL.gpu.renderpass.create.metal.rasterization_rate_map"
+#define SDL_PROP_GPU_RENDERPASS_CREATE_METAL_DEPTH_RESOLVE_TEXTURE_POINTER "SDL.gpu.renderpass.create.metal.depth_resolve_texture"
+#define SDL_PROP_GPU_RENDERPASS_CREATE_METAL_DEPTH_RESOLVE_LAYER_NUMBER "SDL.gpu.renderpass.create.metal.depth_resolve_layer"
+#define SDL_PROP_GPU_RENDERPASS_CREATE_METAL_DEPTH_RESOLVE_FILTER_STRING "SDL.gpu.renderpass.create.metal.depth_resolve_filter"
 
 /**
  * Binds a graphics pipeline on a render pass to be used in rendering.
