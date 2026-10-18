@@ -449,6 +449,7 @@ typedef struct MetalTextureContainer
 
     MetalTexture *activeTexture;
     Uint8 canBeCycled;
+    Uint8 memoryless; // MTLStorageModeMemoryless: no load, no store, no copies
 
     Uint32 textureCapacity;
     Uint32 textureCount;
@@ -1507,6 +1508,12 @@ static MetalTexture *METAL_INTERNAL_CreateTexture(
             ? createinfo->layer_count_or_depth
             : 1;
     textureDescriptor.storageMode = MTLStorageModePrivate;
+    if (SDL_GetBooleanProperty(createinfo->props, SDL_PROP_GPU_TEXTURE_CREATE_METAL_MEMORYLESS_BOOLEAN, false)) {
+        // Validated in METAL_CreateTexture (usage, device); here only the mode.
+        if (@available(macOS 11.0, iOS 10.0, tvOS 10.0, *)) {
+            textureDescriptor.storageMode = MTLStorageModeMemoryless;
+        }
+    }
 
     textureDescriptor.usage = 0;
     if (createinfo->usage & (SDL_GPU_TEXTUREUSAGE_COLOR_TARGET |
@@ -1665,6 +1672,29 @@ static SDL_GPUTexture *METAL_CreateTexture(
             createinfo->props,
             SDL_PROP_GPU_TEXTURE_CREATE_METAL_TEXTURE_POINTER,
             NULL);
+        bool memoryless = SDL_GetBooleanProperty(
+            createinfo->props,
+            SDL_PROP_GPU_TEXTURE_CREATE_METAL_MEMORYLESS_BOOLEAN,
+            false);
+
+        if (memoryless && externalTexture == NULL) {
+            // Memoryless: tile-only render target, see the header documentation.
+            const SDL_GPUTextureUsageFlags allowed = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+            if (createinfo->usage == 0 || (createinfo->usage & ~allowed) != 0) {
+                SDL_SetError("A memoryless texture must have COLOR_TARGET or DEPTH_STENCIL_TARGET usage and nothing else (requested usage 0x%x)", (unsigned)createinfo->usage);
+                return NULL;
+            }
+            bool supported = false;
+            if (@available(macOS 11.0, iOS 10.0, tvOS 10.0, *)) {
+                if (@available(macOS 10.15, iOS 13.0, tvOS 13.0, *)) {
+                    supported = [renderer->device supportsFamily:MTLGPUFamilyApple1];
+                }
+            }
+            if (!supported) {
+                SDL_SetError("Memoryless textures are not supported on this device (Apple GPU required)");
+                return NULL;
+            }
+        }
 
         if (externalTexture != NULL) {
             texture = METAL_INTERNAL_WrapExternalTexture(
@@ -1674,6 +1704,7 @@ static SDL_GPUTexture *METAL_CreateTexture(
             if (texture == NULL) {
                 return NULL; // error already set with the mismatch
             }
+            memoryless = (externalTexture.storageMode == MTLStorageModeMemoryless);
         } else {
             texture = METAL_INTERNAL_CreateTexture(
                 renderer,
@@ -1686,7 +1717,10 @@ static SDL_GPUTexture *METAL_CreateTexture(
         container = SDL_calloc(1, sizeof(MetalTextureContainer));
         // External textures are never cycled: the application expects its
         // texture to receive the writes, and SDL could not allocate a twin.
-        container->canBeCycled = (externalTexture != NULL) ? 0 : 1;
+        // Memoryless textures have no contents to protect, cycling them would
+        // only allocate descriptors.
+        container->canBeCycled = (externalTexture != NULL || memoryless) ? 0 : 1;
+        container->memoryless = memoryless ? 1 : 0;
 
         // Copy properties so we don't lose information when the client destroys them
         container->header.info = *createinfo;
@@ -1976,6 +2010,12 @@ static void METAL_UploadToTexture(
         MetalBufferContainer *bufferContainer = (MetalBufferContainer *)source->transfer_buffer;
         MetalTextureContainer *textureContainer = (MetalTextureContainer *)destination->texture;
 
+        if (textureContainer->memoryless) {
+            SDL_SetError("Cannot upload to a memoryless texture");
+            SDL_LogError(SDL_LOG_CATEGORY_GPU, "Cannot upload to a memoryless texture");
+            return;
+        }
+
         MetalTexture *metalTexture = METAL_INTERNAL_PrepareTextureForWrite(renderer, textureContainer, cycle);
 
         [metalCommandBuffer->blitEncoder
@@ -2038,6 +2078,12 @@ static void METAL_CopyTextureToTexture(
         MetalRenderer *renderer = metalCommandBuffer->renderer;
         MetalTextureContainer *srcContainer = (MetalTextureContainer *)source->texture;
         MetalTextureContainer *dstContainer = (MetalTextureContainer *)destination->texture;
+
+        if (srcContainer->memoryless || dstContainer->memoryless) {
+            SDL_SetError("Cannot copy %s a memoryless texture", srcContainer->memoryless ? "from" : "to");
+            SDL_LogError(SDL_LOG_CATEGORY_GPU, "Cannot copy %s a memoryless texture", srcContainer->memoryless ? "from" : "to");
+            return;
+        }
 
         MetalTexture *srcTexture = srcContainer->activeTexture;
         MetalTexture *dstTexture = METAL_INTERNAL_PrepareTextureForWrite(
@@ -2104,6 +2150,12 @@ static void METAL_DownloadFromTexture(
         MetalTexture *metalTexture = textureContainer->activeTexture;
         MetalBufferContainer *bufferContainer = (MetalBufferContainer *)destination->transfer_buffer;
         Uint32 bufferStride = destination->pixels_per_row;
+
+        if (textureContainer->memoryless) {
+            SDL_SetError("Cannot download from a memoryless texture");
+            SDL_LogError(SDL_LOG_CATEGORY_GPU, "Cannot download from a memoryless texture");
+            return;
+        }
         Uint32 bufferImageHeight = destination->rows_per_layer;
         Uint32 bytesPerRow, bytesPerDepthSlice;
 
@@ -2616,6 +2668,37 @@ static bool METAL_INTERNAL_BeginRenderPass(
         }
         if (!METAL_INTERNAL_ReadDepthResolve(depthStencilTargetInfo, viewCount, props, &depthResolve)) {
             return false;
+        }
+
+        // Memoryless targets exist only during the pass: nothing to load, nothing to store.
+        for (Uint32 i = 0; i < numColorTargets; i += 1) {
+            const MetalTextureContainer *container = (const MetalTextureContainer *)colorTargetInfos[i].texture;
+            if (!container->memoryless) {
+                continue;
+            }
+            if (colorTargetInfos[i].load_op == SDL_GPU_LOADOP_LOAD) {
+                SDL_SetError("Color target %u is memoryless and cannot be loaded (use CLEAR or DONT_CARE)", i);
+                return false;
+            }
+            if (colorTargetInfos[i].store_op == SDL_GPU_STOREOP_STORE || colorTargetInfos[i].store_op == SDL_GPU_STOREOP_RESOLVE_AND_STORE) {
+                SDL_SetError("Color target %u is memoryless and cannot be stored (use DONT_CARE or RESOLVE)", i);
+                return false;
+            }
+        }
+        if (depthStencilTargetInfo != NULL) {
+            const MetalTextureContainer *container = (const MetalTextureContainer *)depthStencilTargetInfo->texture;
+            if (container->memoryless) {
+                const bool stencil = IsStencilFormat(container->header.info.format);
+                if (depthStencilTargetInfo->load_op == SDL_GPU_LOADOP_LOAD || (stencil && depthStencilTargetInfo->stencil_load_op == SDL_GPU_LOADOP_LOAD)) {
+                    SDL_SetError("The depth stencil target is memoryless and cannot be loaded (use CLEAR or DONT_CARE)");
+                    return false;
+                }
+                if (depthStencilTargetInfo->store_op == SDL_GPU_STOREOP_STORE || depthStencilTargetInfo->store_op == SDL_GPU_STOREOP_RESOLVE_AND_STORE ||
+                    (stencil && (depthStencilTargetInfo->stencil_store_op == SDL_GPU_STOREOP_STORE || depthStencilTargetInfo->stencil_store_op == SDL_GPU_STOREOP_RESOLVE_AND_STORE))) {
+                    SDL_SetError("The depth stencil target is memoryless and cannot be stored (use DONT_CARE, or a depth resolve texture)");
+                    return false;
+                }
+            }
         }
 
         for (Uint32 i = 0; i < numColorTargets; i += 1) {

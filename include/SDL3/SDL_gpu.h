@@ -1796,7 +1796,7 @@ typedef struct SDL_GPUTextureCreateInfo
     Uint32 height;                    /**< The height of the texture. */
     Uint32 layer_count_or_depth;      /**< The layer count or depth of the texture. This value is treated as a layer count on 2D array textures, and as a depth value on 3D textures. */
     Uint32 num_levels;                /**< The number of mip levels in the texture. */
-    SDL_GPUSampleCount sample_count;  /**< The number of samples per texel. Only applies if the texture is used as a render target. 2D and 2D array textures may be multisample (a multisample 2D array is the render target of a multiview pass that resolves into layered targets). */
+    SDL_GPUSampleCount sample_count;  /**< The number of samples per texel. Only applies if the texture is used as a render target. 2D and 2D array textures may be multisample (a multisample 2D array is the render target of a multiview pass that resolves into layered targets; multisample 2D arrays are only tested with the Metal backend). */
 
     SDL_PropertiesID props;           /**< A properties ID for extensions. Should be 0 if no extensions are needed. */
 } SDL_GPUTextureCreateInfo;
@@ -3230,6 +3230,18 @@ extern SDL_DECLSPEC SDL_GPUShader * SDLCALL SDL_CreateGPUShader(
  *   releases only that reference after SDL_ReleaseGPUTexture, once no
  *   submitted command buffer uses it anymore; the application keeps
  *   ownership. Defaults to NULL.
+ * - `SDL_PROP_GPU_TEXTURE_CREATE_METAL_MEMORYLESS_BOOLEAN`: (Metal only) if
+ *   true, the texture is created with `MTLStorageModeMemoryless`: it lives
+ *   only in tile memory during a render pass and has no backing allocation.
+ *   This is meant for multisample targets that are resolved at the end of
+ *   the pass. The usage must be COLOR_TARGET or DEPTH_STENCIL_TARGET only
+ *   (no SAMPLER, no storage usage), the device must be an Apple GPU, and
+ *   the texture is never cycled. Render passes on such a texture may not
+ *   use `SDL_GPU_LOADOP_LOAD`, `SDL_GPU_STOREOP_STORE` or
+ *   `SDL_GPU_STOREOP_RESOLVE_AND_STORE` (use CLEAR or DONT_CARE to load,
+ *   DONT_CARE or RESOLVE to store), and uploads, downloads and texture
+ *   copies with the texture fail. Creation fails with a descriptive error if
+ *   a rule is violated. Defaults to false.
  *
  * \param device a GPU Context.
  * \param createinfo a struct describing the state of the texture to create.
@@ -3263,6 +3275,7 @@ extern SDL_DECLSPEC SDL_GPUTexture * SDLCALL SDL_CreateGPUTexture(
 #define SDL_PROP_GPU_TEXTURE_CREATE_D3D12_CLEAR_STENCIL_NUMBER  "SDL.gpu.texture.create.d3d12.clear.stencil"
 #define SDL_PROP_GPU_TEXTURE_CREATE_NAME_STRING                 "SDL.gpu.texture.create.name"
 #define SDL_PROP_GPU_TEXTURE_CREATE_METAL_TEXTURE_POINTER       "SDL.gpu.texture.create.metal.texture"
+#define SDL_PROP_GPU_TEXTURE_CREATE_METAL_MEMORYLESS_BOOLEAN    "SDL.gpu.texture.create.metal.memoryless"
 
 /**
  * Creates a buffer object to be used in graphics or compute workflows.

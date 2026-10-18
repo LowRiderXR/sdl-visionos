@@ -2008,7 +2008,10 @@ SDL_GPURenderPass *SDL_BeginGPURenderPassWithProperties(
         }
     }
 
-    if (view_count > 1 || (props != 0 && COMMAND_BUFFER_DEVICE->BeginRenderPassWithProperties != NULL)) {
+    // Backends with the properties hook take every pass through it, so that
+    // backend-side validation (for example memoryless targets) can fail the
+    // pass; the legacy hook cannot report failure.
+    if (view_count > 1 || COMMAND_BUFFER_DEVICE->BeginRenderPassWithProperties != NULL) {
         if (!COMMAND_BUFFER_DEVICE->BeginRenderPassWithProperties(
                 command_buffer,
                 color_target_infos,
